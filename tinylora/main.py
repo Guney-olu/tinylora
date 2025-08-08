@@ -2,11 +2,27 @@
 import time
 import contextlib
 from tinygrad.tensor import Tensor
-from tinygrad.nn.state import get_parameters, load_state_dict, safe_load, safe_save
+from tinygrad.nn.state import get_parameters, load_state_dict, safe_load, safe_save, get_state_dict
 from tinygrad.nn.optim import Adam
 
 from model import GPT
 import lora
+
+def find_lora_params(model_or_module):
+    """
+    Recursively traverses the model to find all LoRA parameters (A and B matrices).
+    """
+    found_params = []
+    for name, layer in model_or_module.__dict__.items():
+        if isinstance(layer, lora.LoRAWrapper):
+            found_params.extend(layer.trainable_params)
+        elif isinstance(layer, list):
+            for sub_layer in layer:
+                if hasattr(sub_layer, '__dict__'):
+                    found_params.extend(find_lora_params(sub_layer))
+        elif hasattr(layer, '__dict__') and not isinstance(layer, lora.LoRALayer):
+            found_params.extend(find_lora_params(layer))
+    return found_params
 
 @contextlib.contextmanager
 def train_mode():
@@ -23,8 +39,8 @@ LORA_ADAPTER_PATH = "weights/pirate_adapter.safetensors"
 PRIVATE_DATA_PATH = "data/private_data.txt"
 
 PYTHIA_CONFIG = {"dim": 128, "n_layers": 6, "n_heads": 4}
-LEARNING_RATE = 1e-4
-EPOCHS = 40
+LEARNING_RATE = 1e-3
+EPOCHS = 200
 
 def load_base_model_and_tokenizer(config):
     with open(PRIVATE_DATA_PATH, 'r') as f:
@@ -37,21 +53,17 @@ def load_base_model_and_tokenizer(config):
     decode = lambda l: ''.join([itos.get(i, '?') for i in l])
     model = GPT(**config, vocab_size=vocab_size)
     weights = safe_load(MODEL_WEIGHTS_PATH)
-    weights = {k:v for k,v in weights.items() if 'wte' not in k and 'lm_head' not in k and 'embed_in' not in k and 'embed_out' not in k}
+    weights = {k:v for k,v in weights.items() if 'wte' not in k and 'lm_head' not in k}
     load_state_dict(model, weights, strict=False)
     print(f"Loaded base model weights from {MODEL_WEIGHTS_PATH}")
     return model, encode, decode
 
-def generate_text(model, encode, decode, start_string, max_len=50, temperature=0.7):
+def generate_text(model, encode, decode, start_string, max_len=100, temperature=0.5):
     tokens = encode(start_string)
     for _ in range(max_len):
         input_tensor = Tensor([tokens])
-        # The call to model() is now simple, with NO start_pos
         logits = model(input_tensor)
-        
-        # Get the logits for the very last token
         logits = logits[:, -1, :] / temperature
-        
         probs = logits.softmax()
         next_token = probs.multinomial().item()
         tokens.append(next_token)
@@ -61,15 +73,35 @@ def main():
     print("--- On-Device Fine-Tuning Simulation using tinygrad ---")
     model, encode, decode = load_base_model_and_tokenizer(PYTHIA_CONFIG)
     
-    print("\nFreezing all base model parameters...")
-    for p in get_parameters(model): p.requires_grad = False
+    print("\n1. Freezing all model parameters by default...")
+    for p in get_state_dict(model).values():
+        p.requires_grad = False
 
-    print("Injecting LoRA adapters into the model...")
-    trainable_params = lora.inject_lora_into_model(model)
-    total_params = sum(p.numel() for p in trainable_params)
-    print(f"Total trainable parameters (LoRA only): {total_params} ({total_params/1e6:.4f}M)")
+    print("2. Injecting LoRA adapters (these are born trainable)...")
+    lora.inject_lora_into_model(model)
+
+    print("3. Unfreezing specific layers for full fine-tuning...")
+    for p in get_state_dict(model.wte).values(): p.requires_grad = True
+    for p in get_state_dict(model.lm_head).values(): p.requires_grad = True
+    for p in get_state_dict(model.ln_f).values(): p.requires_grad = True
+    for block in model.h:
+        for p in get_state_dict(block.ln_1).values(): p.requires_grad = True
+        for p in get_state_dict(block.ln_2).values(): p.requires_grad = True
+
+    print("4. Collecting all trainable parameters...")
+    trainable_params = get_parameters(model)
     
-    print("\n--- Running inference BEFORE fine-tuning ---")
+    # --- START OF FIX: Correctly count the parameters ---
+    total_params = sum(p.numel() for p in trainable_params)
+    lora_params_list = find_lora_params(model)
+    lora_only_params = sum(p.numel() for p in lora_params_list)
+    # --- END OF FIX ---
+
+    print(f"\nTotal trainable parameters: {total_params} ({total_params/1e6:.4f}M)")
+    print(f" -> LoRA parameters: {lora_only_params}")
+    print(f" -> Other fine-tuned parameters: {total_params - lora_only_params}")
+    
+    print("\n--- Running inference BEFORE fine-tuning (expect gibberish) ---")
     prompt = "Ahoy, "
     generated = generate_text(model, encode, decode, prompt)
     print(f"Prompt: '{prompt}'")
@@ -89,7 +121,7 @@ def main():
             loss = model(input_tensor).sparse_categorical_crossentropy(target_tensor)
             loss.backward()
             optimizer.step()
-            if (i+1) % 5 == 0:
+            if (i+1) % 10 == 0:
                 print(f"Epoch {i+1}/{EPOCHS} | Loss: {loss.item():.4f}")
 
     print("\n--- Saving the personalized LoRA adapter ---")
@@ -97,20 +129,10 @@ def main():
     safe_save(lora_state_dict, LORA_ADAPTER_PATH)
     print(f"Saved {len(lora_state_dict)} LoRA tensors to {LORA_ADAPTER_PATH}")
     
-    print("\n--- Verifying: Loading adapter into a new, clean model ---")
-    fresh_model, _, _ = load_base_model_and_tokenizer(PYTHIA_CONFIG)
-    _ = lora.inject_lora_into_model(fresh_model)
-    saved_adapter_weights = safe_load(LORA_ADAPTER_PATH)
-    lora.load_lora_state_dict(fresh_model, saved_adapter_weights)
-    print("Adapter weights loaded successfully.")
-    
-    print("\n--- Running inference with the re-loaded adapter ---")
-    generated = generate_text(fresh_model, encode, decode, prompt, temperature=0.5)
+    print("\n--- Running inference AFTER fine-tuning ---")
+    generated = generate_text(model, encode, decode, prompt, temperature=0.5)
     print(f"Prompt: '{prompt}'")
     print(f"Generated: '{generated}'")
-    print("\nSuccess! The program ran without crashing.")
-    print("NOTE: The output may still be repetitive. To fix that, we need to implement RoPE(TODO).")
-
 
 if __name__ == "__main__":
     main()
