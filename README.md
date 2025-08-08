@@ -1,2 +1,2 @@
 # tinylora
-Tinygrad to fine-tune llms
+Simple Tinygrad implementation to fine-tune llm
