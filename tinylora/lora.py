@@ -16,8 +16,6 @@ class LoRAWrapper:
     def __init__(self, original_layer: Linear, rank=4, alpha=1.0):
         assert isinstance(original_layer, Linear), "Can only wrap Linear layers"
         self.original_layer = original_layer
-        # Linear.weight is (out_features, in_features).
-        # LoRALayer expects (in_features, out_features).
         in_features = original_layer.weight.shape[1]
         out_features = original_layer.weight.shape[0]
         self.lora_layer = LoRALayer(in_features, out_features, rank, alpha)
@@ -32,7 +30,8 @@ class LoRAWrapper:
 def inject_lora_into_model(model):
     trainable_lora_params = []
     for name, layer in model.__dict__.items():
-        if isinstance(layer, Linear):
+        # Don't wrap the lm_head as we will train it fully.
+        if isinstance(layer, Linear) and name != 'lm_head':
             print(f"  -> Wrapping layer: {name}")
             wrapper = LoRAWrapper(layer, rank=8)
             setattr(model, name, wrapper)
@@ -75,3 +74,4 @@ def load_lora_state_dict(model, state_dict, prefix=""):
                     load_lora_state_dict(sub_layer, state_dict, prefix=f"{current_prefix}.{i}")
         elif hasattr(layer, '__dict__'):
             load_lora_state_dict(layer, state_dict, prefix=current_prefix)
+
