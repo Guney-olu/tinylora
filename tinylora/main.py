@@ -24,6 +24,7 @@ def find_lora_params(model_or_module):
             found_params.extend(find_lora_params(layer))
     return found_params
 
+
 @contextlib.contextmanager
 def train_mode():
     """A context manager to enable training mode. This is required by the optimizer."""
@@ -41,6 +42,10 @@ PRIVATE_DATA_PATH = "data/private_data.txt"
 PYTHIA_CONFIG = {"dim": 128, "n_layers": 6, "n_heads": 4}
 LEARNING_RATE = 1e-3
 EPOCHS = 200
+
+
+TUNE_NORM_LAYERS = False
+
 
 def load_base_model_and_tokenizer(config):
     with open(PRIVATE_DATA_PATH, 'r') as f:
@@ -80,22 +85,29 @@ def main():
     print("2. Injecting LoRA adapters (these are born trainable)...")
     lora.inject_lora_into_model(model)
 
-    print("3. Unfreezing specific layers for full fine-tuning...")
+    print("3. Unfreezing specific layers for fine-tuning...")
+    
+    # ALWAYS unfreeze wte and lm_head for a new vocabulary. This is mandatory.
+    print(" -> Unfreezing wte and lm_head (mandatory for new vocab)")
     for p in get_state_dict(model.wte).values(): p.requires_grad = True
     for p in get_state_dict(model.lm_head).values(): p.requires_grad = True
-    for p in get_state_dict(model.ln_f).values(): p.requires_grad = True
-    for block in model.h:
-        for p in get_state_dict(block.ln_1).values(): p.requires_grad = True
-        for p in get_state_dict(block.ln_2).values(): p.requires_grad = True
+    
+    # CONDITIONALLY unfreeze normalization layers based on the flag.
+    if TUNE_NORM_LAYERS:
+        print(" -> Unfreezing normalization layers (optional)")
+        for p in get_state_dict(model.ln_f).values(): p.requires_grad = True
+        for block in model.h:
+            for p in get_state_dict(block.ln_1).values(): p.requires_grad = True
+            for p in get_state_dict(block.ln_2).values(): p.requires_grad = True
+    else:
+        print(" -> Keeping normalization layers frozen.")
 
     print("4. Collecting all trainable parameters...")
     trainable_params = get_parameters(model)
     
-    # --- START OF FIX: Correctly count the parameters ---
     total_params = sum(p.numel() for p in trainable_params)
     lora_params_list = find_lora_params(model)
     lora_only_params = sum(p.numel() for p in lora_params_list)
-    # --- END OF FIX ---
 
     print(f"\nTotal trainable parameters: {total_params} ({total_params/1e6:.4f}M)")
     print(f" -> LoRA parameters: {lora_only_params}")
